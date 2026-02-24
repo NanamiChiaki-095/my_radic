@@ -176,6 +176,20 @@ open http://localhost:8080
 *   **Q: 为什么不用互斥锁直接锁住整个函数？**
     *   A: 互斥锁是**串行化**（一个接一个），SingleFlight 是**并行合并**（一批只执行一次），吞吐量天差地别。
 
+### 5.1.1 gRPC 客户端连接池与“锁外 Dial”优化
+
+**背景**：API Gateway 通过 Etcd watch 动态感知 `index_service` 节点变更，并在本地维护 `ShardID -> 节点列表` 的路由表（实现见 `api_gateway/rpc/client.go`）。如果在 `reloadNodes()` 的写锁内执行 `grpc.Dial()`：
+* Dial 可能受 DNS/网络影响变慢，导致写锁长时间持有，进而阻塞所有并发读请求（Search/AddDoc 等），表现为 P99/P999 延迟尖刺。
+* 并发读写连接表（map）如果没有统一加锁，可能触发 data race，严重时会出现 `concurrent map read and map write` 直接崩溃。
+
+**做法**（两阶段提交思路）：
+1. **锁外准备**：从 Etcd 取到最新节点列表，计算 `wantedAddrs`（目标地址集合）；在 `RLock` 下快照当前 `conns`；对缺失地址在锁外 Dial（得到 `dialedConns`）。
+2. **锁内提交**：在 `Lock` 下合并 `dialedConns` 到 `conns`（若已存在则关闭重复连接），构建新的 `shards/clients/totalShards`，并关闭不再需要的旧连接（地址不在 `wantedAddrs`）。
+
+**收益**：
+* 把慢操作（Dial）从写锁中移出去，显著降低热点路径的锁竞争与尾延迟。
+* 连接可复用、节点下线时可关闭，避免 gRPC 连接泄漏导致的长期资源增长。
+
 ### 5.2 倒排索引：为什么选择跳表 (SkipList)?
 **原理**：跳表是一种**概率性平衡**的数据结构，通过维护多层链表来加速查找。底层是完整链表，上层是稀疏索引。
 *   **Search**: 从最高层开始，`Key > Next` 则右移，`Key < Next` 则下潜。复杂度 O(log N)。

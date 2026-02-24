@@ -472,13 +472,7 @@ func (s *IndexServiceWorker) Register(etcdServers []string, servicePort int) err
 		ShardId:     s.ShardID,
 		TotalShards: s.TotalShards,
 	}
-	val, err := proto.Marshal(info)
-	if err != nil {
-		util.LogError("Register err: %v", err)
-		return err
-	}
-
-	_, err = s.Hub.Register(key, string(val), 0)
+	_, err = s.Hub.RegisterProto(key, info, 0)
 	if err != nil {
 		util.LogError("Register err: %v", err)
 		return err

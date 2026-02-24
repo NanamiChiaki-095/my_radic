@@ -95,3 +95,32 @@ spec:
       - name: config
         configMap:
           name: gateway-config
+
+---
+# ================= Relay Service (Deployment) =================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay
+  namespace: radic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: relay
+  template:
+    metadata:
+      labels:
+        app: relay
+    spec:
+      containers:
+      - name: relay
+        image: my_radic/relay:v1
+        imagePullPolicy: Never
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+      volumes:
+      - name: config
+        configMap:
+          name: gateway-config

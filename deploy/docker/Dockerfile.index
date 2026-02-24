@@ -11,7 +11,7 @@ RUN go mod download
 # 复制代码并编译
 COPY . .
 # 修正编译路径：Index Service 的入口是根目录下的 main.go
-RUN CGO_ENABLED=0 GOOS=linux go build -o index_server ./main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o index_server ./cmd/index_service/main.go
 
 # --- 第二阶段：Runner ---
 FROM alpine:latest

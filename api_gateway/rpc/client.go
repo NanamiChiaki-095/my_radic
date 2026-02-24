@@ -51,6 +51,8 @@ type MultiIndexServiceClient struct {
 	balancer Balancer
 	// sf (SingleFlight) 用于防止热点查询击穿，合并重复的并发请求。
 	sf singleflight.Group
+
+	conns map[string]*grpc.ClientConn
 }
 
 // Pick 实现轮询算法，使用原子操作保证并发安全。
@@ -294,6 +296,7 @@ func Init(etcdServers []string) error {
 		balancer: &RoundRobinBalancer{counter: 0},
 		shards:   make(map[int32][]index_service.IndexServiceClient),
 		clients:  make([]index_service.IndexServiceClient, 0),
+		conns:    make(map[string]*grpc.ClientConn),
 	}
 
 	// 第一次全量加载节点信息
@@ -326,54 +329,110 @@ func getShardID(docID string, totalShards int32) int32 {
 func (m *MultiIndexServiceClient) reloadNodes(etcdServers []string) {
 	nodes, err := index_service.GetServiceHub(etcdServers, 3).GetServiceSpec("index_service")
 	if err != nil {
-		util.LogError("Failed to reload nodes: %v", err)
+		util.LogError("Failed to reload nodes :%v", err)
 		return
+	}
+
+	wantedAddrs := map[string]struct{}{}
+	for _, node := range nodes {
+		if node == nil || node.ServiceAddr == "" {
+			continue
+		}
+		wantedAddrs[node.ServiceAddr] = struct{}{}
+	}
+	m.mu.RLock()
+	existingConns := make(map[string]*grpc.ClientConn, len(m.conns))
+	for addr, conn := range m.conns {
+		existingConns[addr] = conn
+	}
+	m.mu.RUnlock()
+
+	dialedConns := make(map[string]*grpc.ClientConn)
+	for addr := range wantedAddrs {
+		if existingConns[addr] != nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		conn, err := grpc.DialContext(ctx, addr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+		cancel()
+		if err != nil {
+			util.LogError("Failed to dial %s: %v", addr, err)
+			continue
+		}
+		dialedConns[addr] = conn
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.conns == nil {
+		m.conns = make(map[string]*grpc.ClientConn)
+	}
+
+	for addr, conn := range dialedConns {
+		if m.conns[addr] == nil {
+			m.conns[addr] = conn
+		} else {
+			_ = conn.Close()
+		}
 	}
 
 	newShards := make(map[int32][]index_service.IndexServiceClient)
 	newClients := make([]index_service.IndexServiceClient, 0, len(nodes))
 	newTotalShards := int32(0)
+	totalShardsSet := false
 
-	for i, node := range nodes {
-		// 建立 gRPC 连接 (使用非阻塞模式)
-		conn, err := grpc.Dial(node.ServiceAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			util.LogError("Failed to dial %s: %v", node.ServiceAddr, err)
+	for _, node := range nodes {
+		if node == nil || node.ServiceAddr == "" {
+			continue
+		}
+		conn := m.conns[node.ServiceAddr]
+		if conn == nil {
 			continue
 		}
 
-		if i == 0 {
-			newTotalShards = node.TotalShards
-		} else {
-			if node.TotalShards != newTotalShards {
-				util.LogError("inconsistent TotalShards detected: expected %d, got %d form %s", newTotalShards, node.TotalShards, node.ServiceAddr)
+		if !totalShardsSet {
+			if node.TotalShards <= 0 {
+				util.LogError("invalid TotalShards detected: %d from %s", node.TotalShards, node.ServiceAddr)
 				continue
 			}
+			newTotalShards = node.TotalShards
+			totalShardsSet = true
+		} else if node.TotalShards != newTotalShards {
+			util.LogError("inconsistent TotalShards detected: expected %d, got %d", newTotalShards, node.TotalShards)
+			continue
 		}
 
 		client := index_service.NewIndexServiceClient(conn)
+		if node.ShardId < 0 || node.ShardId >= newTotalShards {
+			continue
+		}
 		newClients = append(newClients, client)
-		// 将节点加入对应的分片副本集
 		newShards[node.ShardId] = append(newShards[node.ShardId], client)
+	}
 
-		// 更新全局总分片数
-		if node.TotalShards > newTotalShards {
-			newTotalShards = node.TotalShards
+	for addr, conn := range m.conns {
+		if _, ok := wantedAddrs[addr]; !ok {
+			_ = conn.Close()
+			delete(m.conns, addr)
 		}
 	}
 
-	m.mu.Lock()
 	m.shards = newShards
 	m.clients = newClients
 	m.totalShards = newTotalShards
-	defer m.mu.Unlock()
 }
 
 func (m *MultiIndexServiceClient) watch(etcdServers []string) {
-	cli, _ := clientv3.New(clientv3.Config{
+	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   etcdServers,
 		DialTimeout: 5 * time.Second,
 	})
+	if err != nil {
+		util.LogError("Failed to init etcd client: %v", err)
+		return
+	}
+	defer cli.Close()
 
 	watchChan := cli.Watch(context.Background(), "/radic/index_service", clientv3.WithPrefix())
 

@@ -42,7 +42,7 @@ func main() {
 
 	// 3. 构造路由并启动
 	r := router.NewRouter()
-	
+
 	util.LogInfo("Starting API Gateway on port %d...", *port)
 	if err := r.Run(fmt.Sprintf(":%d", *port)); err != nil {
 		util.LogError("Failed to start server: %v", err)
@@ -65,10 +65,11 @@ func setupInfra() {
 	}
 
 	// 启动后台消息中继
-	infra.StartRelay(config.Conf.Kafka.Topic)
+	// Relay service runs as dedicated cmd/relay.
 }
 
 func closeInfra() {
 	infra.CloseKafka()
 	infra.CloseRedis()
+	infra.CloseMySQL()
 }

@@ -1,6 +1,7 @@
 package infra
 
 import (
+	"context"
 	"my_radic/api_gateway/model"
 	"my_radic/util"
 	"time"
@@ -8,10 +9,19 @@ import (
 
 // StartRelay 启动后台消息转发协程
 // 负责将 Outbox 表中的消息异步发送到 Kafka
-func StartRelay(kafkaTopic string) {
+func StartRelay(ctx context.Context, kafkaTopic string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	go func() {
 		util.LogInfo("Relay service started, topic: %s", kafkaTopic)
 		for {
+			select {
+			case <-ctx.Done():
+				util.LogInfo("Relay service stopped: %v", ctx.Err())
+				return
+			default:
+			}
 			var tasks []model.Outbox
 			// 1. 捞取待发送消息 (Limit 100)
 			// 注意：这里直接使用本包内的全局变量 DB

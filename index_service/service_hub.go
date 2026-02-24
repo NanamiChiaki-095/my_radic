@@ -53,13 +53,17 @@ func GetServiceHub(etcdServers []string, heartbeat int64) *ServiceHub {
 
 func (s *ServiceHub) Close() {
 	s.closeOnce.Do(func() {
-		s.client.Close()
-		s.cancel()
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.client != nil {
+			_ = s.client.Close()
+		}
 	})
 }
 
-func (s *ServiceHub) Register(key string, value string, leaseID clientv3.LeaseID) (clientv3.LeaseID, error) {
-	util.LogInfo("Register key: %s, value: %s", key, value)
+func (s *ServiceHub) Register(key string, value []byte, leaseID clientv3.LeaseID) (clientv3.LeaseID, error) {
+	util.LogInfo("Register key: %s, value_len: %d", key, len(value))
 	//创建租约
 	if leaseID <= 0 {
 		grant, err := s.client.Grant(s.ctx, s.heartbeat)
@@ -74,19 +78,33 @@ func (s *ServiceHub) Register(key string, value string, leaseID clientv3.LeaseID
 		}
 		go func() {
 			for resp := range ch {
+				if resp == nil {
+					continue
+				}
 				util.LogDebug("Lease %x renewed, ttl: %d", resp.ID, resp.TTL)
 			}
 			util.LogWarn("Lease %x lost", leaseID)
 		}()
 	}
 
-	Key := path.Join("/radic", key)
-	Value := value
-	_, err := s.client.Put(s.ctx, Key, Value, clientv3.WithLease(leaseID))
+	etcdKey := path.Join("/radic", key)
+	etcdVal := string(value)
+	_, err := s.client.Put(s.ctx, etcdKey, etcdVal, clientv3.WithLease(leaseID))
 	if err != nil {
 		return 0, err
 	}
 	return leaseID, nil
+}
+
+func (s *ServiceHub) RegisterProto(key string, msg proto.Message, leaseID clientv3.LeaseID) (clientv3.LeaseID, error) {
+	if msg == nil {
+		return 0, nil
+	}
+	val, err := proto.Marshal(msg)
+	if err != nil {
+		return 0, err
+	}
+	return s.Register(key, val, leaseID)
 }
 
 func (s *ServiceHub) GetServiceSpec(serviceName string) ([]*ServiceNodeInfo, error) {
@@ -118,6 +136,11 @@ func (s *ServiceHub) CampaignLeader(ctx context.Context, key, value string, ttl 
 		ttl = s.heartbeat
 	}
 	for {
+		var (
+			getResp  *clientv3.GetResponse
+			watchRev int64
+			wch      clientv3.WatchChan
+		)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -176,15 +199,18 @@ func (s *ServiceHub) CampaignLeader(ctx context.Context, key, value string, ttl 
 			onFollower()
 		}
 
-		getResp, err := s.client.Get(ctx, key)
+		getResp, err = s.client.Get(ctx, key)
 		if err != nil {
 			time.Sleep(time.Second)
 			util.LogError("CampaignLeader err: %v", err)
 			continue
 		}
-		watchRev := getResp.Header.Revision + 1
+		if len(getResp.Kvs) == 0 {
+			goto retry
+		}
+		watchRev = getResp.Header.Revision + 1
 
-		wch := s.client.Watch(ctx, key, clientv3.WithRev(watchRev))
+		wch = s.client.Watch(ctx, key, clientv3.WithRev(watchRev))
 		for wresp := range wch {
 			if wresp.Canceled {
 				break
