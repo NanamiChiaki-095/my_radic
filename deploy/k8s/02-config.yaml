@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+  namespace: radic
+data:
+  config.yaml: |
+    kafka:
+      endpoints:
+        - "kafka:9092"
+      topic: "radic_doc_topic"
+    mysql:
+      host: "mysql"
+      port: 3306
+      user: "root"
+      password: ""
+      db_name: "my_radic"
+    etcd:
+      endpoints:
+        - "etcd:2379"
+    redis:
+      addr: "redis:6379"
+      password: ""
+      db: 0
+    rate_limit:
+      enabled: true
+      qps: 10000
+      burst: 2000
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: indexer-config
+  namespace: radic
+data:
+  config.yaml: |
+    kafka:
+      endpoints:
+        - "kafka:9092"
+      topic: "radic_doc_topic"
+    etcd:
+      endpoints:
+        - "etcd:2379"
+    data_dir: "/data"
+    db_type: "badger"
+    rpc_port: 9000

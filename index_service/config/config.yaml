@@ -1,0 +1,13 @@
+etcd:
+  endpoints:
+  - "127.0.0.1:2379"
+
+kafka:
+  endpoints:
+  - "127.0.0.1:9092"
+  topic: "radic_doc_topic"
+data_dir: "./data"
+db_type: "badger"
+rpc_port: 9000
+shard_id: 0
+total_shards: 3

@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package types;
+
+option go_package = "my_radic/types";
+
+message Keyword{
+    string Field = 1; // 字段名, 如"title"
+    string Word = 2;    //关键词内容, 如"go"
+}
+
+message Document{
+    string Id = 1;  //业务侧唯一ID(如视频ID)
+    uint64 IntId = 2;   //内部自增ID(用于优化存储)
+    uint64 BitsFeature = 3; //位图特征(用于快速过滤)
+    repeated Keyword Keyword = 4;   //包含的关键词列表
+    bytes Bytes = 5;    //原始数据的二进制内容
+    double Score = 6; //搜索打分
+    string Content = 7; //待分词的正文内容
+    string Title = 8;
+    string Url = 9;
+}

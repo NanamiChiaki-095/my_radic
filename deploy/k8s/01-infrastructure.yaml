@@ -1,0 +1,193 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: radic
+
+---
+# ================= MySQL =================
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: radic
+spec:
+  ports:
+  - port: 3306
+  selector:
+    app: mysql
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: radic
+spec:
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        env:
+        - name: MYSQL_ALLOW_EMPTY_PASSWORD
+          value: "yes"
+        - name: MYSQL_DATABASE
+          value: "my_radic"
+        ports:
+        - containerPort: 3306
+
+---
+# ================= Redis =================
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: radic
+spec:
+  ports:
+  - port: 6379
+  selector:
+    app: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: radic
+spec:
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.0
+        ports:
+        - containerPort: 6379
+
+---
+# ================= Etcd =================
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd
+  namespace: radic
+spec:
+  ports:
+  - port: 2379
+    name: client
+  selector:
+    app: etcd
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etcd
+  namespace: radic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: etcd
+  template:
+    metadata:
+      labels:
+        app: etcd
+    spec:
+      containers:
+      - name: etcd
+        image: quay.io/coreos/etcd:v3.5.0
+        command:
+        - /usr/local/bin/etcd
+        - --name=etcd0
+        - --advertise-client-urls=http://etcd:2379
+        - --listen-client-urls=http://0.0.0.0:2379
+        - --initial-advertise-peer-urls=http://0.0.0.0:2380
+        - --listen-peer-urls=http://0.0.0.0:2380
+        - --initial-cluster=etcd0=http://0.0.0.0:2380
+        - --initial-cluster-state=new
+        ports:
+        - containerPort: 2379
+
+---
+# ================= Zookeeper =================
+apiVersion: v1
+kind: Service
+metadata:
+  name: zookeeper
+  namespace: radic
+spec:
+  ports:
+  - port: 2181
+  selector:
+    app: zookeeper
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zookeeper
+  namespace: radic
+spec:
+  selector:
+    matchLabels:
+      app: zookeeper
+  template:
+    metadata:
+      labels:
+        app: zookeeper
+    spec:
+      containers:
+      - name: zookeeper
+        image: zookeeper:3.8
+        ports:
+        - containerPort: 2181
+
+---
+# ================= Kafka =================
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: radic
+spec:
+  ports:
+  - port: 9092
+  selector:
+    app: kafka
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka
+  namespace: radic
+spec:
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      enableServiceLinks: false
+      containers:
+      - name: kafka
+        image: wurstmeister/kafka:2.13-2.8.1
+        env:
+        - name: KAFKA_ZOOKEEPER_CONNECT
+          value: "zookeeper:2181"
+        - name: KAFKA_ADVERTISED_LISTENERS
+          value: "PLAINTEXT://kafka:9092"
+        - name: KAFKA_LISTENERS
+          value: "PLAINTEXT://0.0.0.0:9092"
+        ports:
+        - containerPort: 9092

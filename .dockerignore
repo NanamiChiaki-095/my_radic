@@ -1,0 +1,23 @@
+# 排除本地数据库目录
+data/
+badger/
+*.db
+*.bolt
+
+# 排除二进制文件
+*.exe
+main
+gateway_server
+index_server
+
+# 排除版本控制
+.git
+.gitignore
+
+# 排除日志
+logs/
+*.log
+
+# 排除编辑器配置
+.vscode/
+.idea/

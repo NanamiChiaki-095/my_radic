@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package types;
+
+// 建议写全路径，方便交叉引用
+option go_package = "my_radic/types";
+
+import "types/doc.proto";
+
+message TermQuery {
+    Keyword keyword = 1;
+    repeated TermQuery must = 2;
+    repeated TermQuery should = 3;
+    uint64 on_flag = 4;
+    uint64 off_flag = 5;
+    repeated uint64 or_flag = 6;
+}

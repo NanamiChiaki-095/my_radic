@@ -1,0 +1,35 @@
+port: 8081
+
+server:
+  name: "my-radic-gateway"
+  port: 8081
+  mode: "debug"
+
+redis:
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+  pool_size: 10
+  read_timeout: 500
+
+etcd:
+  endpoints:
+    - "127.0.0.1:2379"
+  dial_timeout: 3000
+
+kafka:
+  endpoints:
+    - "127.0.0.1:9092"
+  topic: "radic_doc_topic"
+
+mysql:
+  host: "127.0.0.1"
+  port: 3306
+  user: "root"
+  password: "" # 请填入你的真实密码
+  db_name: "my_radic"
+
+rate_limit:
+  enabled: true
+  qps: 10000
+  burst: 2000

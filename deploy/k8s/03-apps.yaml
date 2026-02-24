@@ -1,0 +1,97 @@
+# ================= Index Service (StatefulSet) =================
+apiVersion: v1
+kind: Service
+metadata:
+  name: indexer
+  namespace: radic
+spec:
+  ports:
+  - port: 9000
+    name: grpc
+  clusterIP: None # Headless Service，让 Gateway 可以通过 DNS 找到每一个 Pod
+  selector:
+    app: indexer
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: indexer
+  namespace: radic
+spec:
+  serviceName: "indexer"
+  replicas: 3
+  selector:
+    matchLabels:
+      app: indexer
+  template:
+    metadata:
+      labels:
+        app: indexer
+    spec:
+      containers:
+      - name: indexer
+        image: my_radic/indexer:v1
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 9000
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: config
+        configMap:
+          name: indexer-config
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 1Gi
+
+---
+# ================= API Gateway (Deployment) =================
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: radic
+spec:
+  type: LoadBalancer # 本地开发通常用 LoadBalancer 或 NodePort
+  ports:
+  - port: 8080
+    targetPort: 8080
+  selector:
+    app: gateway
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: radic
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+      - name: gateway
+        image: my_radic/gateway:v1
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+      volumes:
+      - name: config
+        configMap:
+          name: gateway-config

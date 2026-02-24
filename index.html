@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MyRadic Search Engine</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background-color: #f8f9fa;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        header {
+            width: 100%;
+            background: white;
+            padding: 20px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        h1 {
+            margin: 0 0 15px 0;
+            color: #202124;
+            font-size: 24px;
+        }
+
+        .search-wrapper {
+            width: 100%;
+            max-width: 600px;
+            padding: 0 20px;
+            box-sizing: border-box;
+        }
+
+        .search-container {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 12px 25px;
+            font-size: 16px;
+            border: 1px solid #dfe1e5;
+            border-radius: 24px;
+            outline: none;
+            box-shadow: none;
+            transition: box-shadow 0.2s;
+        }
+
+        input[type="text"]:hover, input[type="text"]:focus {
+            box-shadow: 0 1px 6px rgba(32,33,36,0.28);
+            border-color: rgba(223,225,229,0);
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 5px;
+        }
+        .connected { background-color: #34a853; }
+        .disconnected { background-color: #ea4335; }
+
+        #status-text {
+            font-size: 12px;
+            color: #70757a;
+            margin-top: 8px;
+        }
+
+        .results {
+            width: 100%;
+            max-width: 650px;
+            margin-top: 20px;
+            padding: 0 20px;
+            box-sizing: border-box;
+        }
+
+        .result-item {
+            margin-bottom: 26px;
+            animation: fadeIn 0.3s ease-in;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .result-url {
+            font-size: 14px;
+            color: #202124;
+            margin-bottom: 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            display: block;
+            text-decoration: none;
+        }
+
+        .result-title {
+            font-size: 20px;
+            color: #1a0dab;
+            text-decoration: none;
+            display: inline-block;
+            margin-bottom: 4px;
+        }
+
+        .result-title:hover {
+            text-decoration: underline;
+        }
+
+        .result-content {
+            font-size: 14px;
+            color: #4d5156;
+            line-height: 1.58;
+            word-wrap: break-word;
+        }
+
+        mark {
+            background-color: transparent;
+            color: #bdc1c6; /* 默认不高亮 */
+            font-weight: bold;
+            color: #202124;
+        }
+
+        .result-meta {
+            font-size: 12px;
+            color: #70757a;
+            margin-top: 4px;
+        }
+
+        .no-results {
+            text-align: center;
+            color: #70757a;
+            margin-top: 50px;
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>MyRadic Search</h1>
+        <div class="search-wrapper">
+            <div class="search-container">
+                <input type="text" id="searchInput" placeholder="请输入关键词..." autofocus>
+            </div>
+            <div id="status-text">
+                <span id="status-dot" class="status-dot disconnected"></span>
+                <span id="status-msg">Connecting...</span>
+            </div>
+        </div>
+    </header>
+
+    <div id="results" class="results"></div>
+
+    <script>
+        const searchInput = document.getElementById('searchInput');
+        const resultsDiv = document.getElementById('results');
+        const statusDot = document.getElementById('status-dot');
+        const statusMsg = document.getElementById('status-msg');
+        let socket;
+
+        function connect() {
+            socket = new WebSocket('ws://localhost:8080/search');
+
+            socket.onopen = () => {
+                statusDot.className = 'status-dot connected';
+                statusMsg.innerText = 'Connected to search engine';
+            };
+
+            socket.onclose = () => {
+                statusDot.className = 'status-dot disconnected';
+                statusMsg.innerText = 'Disconnected - Retrying...';
+                setTimeout(connect, 3000);
+            };
+
+            socket.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    renderResults(data);
+                } catch (e) {
+                    console.error('Data error:', e);
+                }
+            };
+        }
+
+        function renderResults(data) {
+            resultsDiv.innerHTML = '';
+
+            if (!data.results || data.results.length === 0) {
+                if (searchInput.value.trim() !== '') {
+                    resultsDiv.innerHTML = '<div class="no-results">找不到相关结果。</div>';
+                }
+                return;
+            }
+
+            data.results.forEach(doc => {
+                const item = document.createElement('div');
+                item.className = 'result-item';
+                
+                // 关键词高亮
+                const keyword = searchInput.value.trim();
+                let title = doc.Title || "Untitled Document";
+                let content = doc.Content || "";
+                
+                if (keyword) {
+                    const regex = new RegExp(`(${keyword})`, 'gi');
+                    title = title.replace(regex, '<mark>$1</mark>');
+                    content = content.replace(regex, '<mark>$1</mark>');
+                }
+
+                // 如果没有 URL，默认指向详情页接口
+                const targetUrl = doc.Url || `http://localhost:8080/article/${doc.IntId}`;
+
+                item.innerHTML = `
+                    <a class="result-url" href="${targetUrl}" target="_blank">${targetUrl}</a>
+                    <a class="result-title" href="${targetUrl}" target="_blank">${title}</a>
+                    <div class="result-content">${content}</div>
+                    <div class="result-meta">相关度评分: ${doc.Score.toFixed(4)} | DocID: ${doc.IntId}</div>
+                `;
+                resultsDiv.appendChild(item);
+            });
+        }
+
+        function debounce(func, wait) {
+            let timeout;
+            return (...args) => {
+                clearTimeout(timeout);
+                timeout = setTimeout(() => func.apply(this, args), wait);
+            };
+        }
+
+        const handleSearch = debounce(() => {
+            const query = searchInput.value.trim();
+            if (query && socket.readyState === WebSocket.OPEN) {
+                socket.send(query);
+            } else if (!query) {
+                resultsDiv.innerHTML = '';
+            }
+        }, 150);
+
+        searchInput.addEventListener('input', handleSearch);
+        connect();
+    </script>
+</body>
+</html>

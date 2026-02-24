@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package index_service;
+
+// 指定生成GO代码的包路径
+option go_package = "my_radic/index_service";
+
+// 引入之前定义的 types 数据结构
+import "types/doc.proto";
+import "types/term_query.proto";
+
+// AddDocRequest: 添加文档请求
+message AddDocRequest {
+    types.Document doc = 1;
+}
+
+// AddDocResponse: 添加文档响应
+message AddDocResponse {
+    uint64 doc_id = 1; 
+    bool success = 2;
+}
+
+// DeleteDocRequest: 删除文档请求
+message DeleteDocRequest {
+    uint64 doc_id = 1; // 内部 ID (IntId)
+}
+
+// DeleteDocResponse: 删除结果响应
+message DeleteDocResponse {
+    bool success = 1;
+    int32 count = 2; 
+}
+
+// SearchRequest: 搜索请求
+message SearchRequest {
+    types.TermQuery query = 1; 
+}
+
+// SearchResponse: 搜索结果
+message SearchResponse {
+    repeated types.Document results = 1; 
+    int32 total = 2;
+}
+
+// 批量添加文档
+message BatchAddDocRequest{
+    repeated types.Document docs = 1;
+}
+
+// 批量添加文档响应
+message BatchAddDocResponse{
+    repeated uint64 doc_ids = 1;
+    bool success = 2;
+}
+
+// 批量删除文档
+message BatchDeleteDocRequest{
+    repeated uint64 doc_ids = 1;
+}
+
+// 批量删除文档响应
+message BatchDeleteDocResponse{
+    bool success = 1;
+    int32 count = 2;
+}
+
+message ServiceNodeInfo{
+    string service_addr =1;
+    int32 weight = 2;
+    int32 shard_id = 3;
+    int32 total_shards = 4;
+}
+
+service IndexService {
+    // 添加文档
+    rpc AddDoc(AddDocRequest) returns (AddDocResponse);
+
+    // 删除文档
+    rpc DeleteDoc(DeleteDocRequest) returns (DeleteDocResponse);
+
+    // 批量添加文档
+    rpc BatchAddDoc(BatchAddDocRequest) returns (BatchAddDocResponse);
+
+    // 批量删除文档
+    rpc BatchDeleteDoc(BatchDeleteDocRequest) returns (BatchDeleteDocResponse);
+
+    // 搜索
+    rpc Search(SearchRequest) returns (SearchResponse);
+}

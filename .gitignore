@@ -1,0 +1,37 @@
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go tooling / workspace
+/vendor/
+/bin/
+
+# Data / local state
+*.db
+*.log
+
+# BadgerDB / KV store files (should not be committed)
+/data/badger/
+**/badger/
+*.vlog
+*.sst
+MANIFEST
+LOCK
+*.wal
+
+# Environment files
+.env
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+
+# OS cruft
+.DS_Store
+Thumbs.db
