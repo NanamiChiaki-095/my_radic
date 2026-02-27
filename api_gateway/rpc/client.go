@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"golang.org/x/sync/singleflight"
@@ -20,6 +21,36 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+var (
+	searchRPCTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "search_rpc_total",
+			Help: "Total number of backend search RPC calls.",
+		},
+		[]string{"result"},
+	)
+	searchSingleflightSharedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "search_singleflight_shared_total",
+			Help: "Total number of search requests served via shared singleflight result.",
+		},
+	)
+)
+
+func init() {
+	for _, collector := range []prometheus.Collector{
+		searchRPCTotal,
+		searchSingleflightSharedTotal,
+	} {
+		if err := prometheus.Register(collector); err != nil {
+			if _, ok := err.(prometheus.AlreadyRegisteredError); ok {
+				continue
+			}
+			util.LogError("prometheus.Register failed: %v", err)
+		}
+	}
+}
 
 // Client 是全局的 IndexService 客户端实例。
 // 它封装了多节点管理、负载均衡、分片路由和聚合逻辑。
@@ -76,7 +107,7 @@ func (m *MultiIndexServiceClient) Search(ctx context.Context, in *index_service.
 
 	// 使用请求参数构造 Key，确保相同的查询被合并
 	key := fmt.Sprintf("search:%s", in.String())
-	v, err, _ := m.sf.Do(key, func() (interface{}, error) {
+	v, err, shared := m.sf.Do(key, func() (interface{}, error) {
 		var allDocs []*types.Document
 		var wg sync.WaitGroup
 		var mutex sync.Mutex
@@ -90,6 +121,7 @@ func (m *MultiIndexServiceClient) Search(ctx context.Context, in *index_service.
 				// 从当前分片的副本集中选出一个可用节点
 				replicas, ok := m.shards[sid]
 				if !ok || len(replicas) == 0 {
+					searchRPCTotal.WithLabelValues("unavailable").Inc()
 					util.LogError("Shard %d not found or no available nodes", sid)
 					return
 				}
@@ -98,9 +130,11 @@ func (m *MultiIndexServiceClient) Search(ctx context.Context, in *index_service.
 				// 发起 RPC 调用
 				res, err := client.Search(ctx, in, opts...)
 				if err != nil {
+					searchRPCTotal.WithLabelValues("error").Inc()
 					util.LogError("Search Shard %d err: %v", sid, err)
 					return
 				}
+				searchRPCTotal.WithLabelValues("ok").Inc()
 
 				// 汇总结果 (加锁保证 append 安全)
 				mutex.Lock()
@@ -121,6 +155,10 @@ func (m *MultiIndexServiceClient) Search(ctx context.Context, in *index_service.
 			Total:   int32(len(allDocs)),
 		}, nil
 	})
+
+	if shared {
+		searchSingleflightSharedTotal.Inc()
+	}
 
 	if err != nil {
 		return nil, err

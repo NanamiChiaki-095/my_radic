@@ -1,230 +1,265 @@
-# MyRadic - 分布式实时搜索引擎
+# MyRadic 架构与实现说明（面试版）
 
-## 1. 项目简介
-
-`my_radic` 是一个基于 Go 语言实现的**工业级分布式搜索引擎**。项目定位于解决中大规模文本检索场景下的**高并发**、**低延迟**与**强一致性**问题。
-
-本项目不依赖 ElasticSearch 等现成组件，而是**从零手写**了倒排索引内核、分词器集成、微服务通信框架及分布式事务保障机制。
+> 更新时间：2026-02-27  
+> 目标读者：面试官 / 技术评审 / 项目协作者  
+> 关键词：分布式搜索、最终一致性、倒排索引、高并发、可观测性、压测
 
 ---
 
-## 2. 核心架构设计
+## 1. 项目定位（一句话）
 
-### 2.1 架构全景图 (Microservices Architecture)
+`my_radic` 是一个使用 Go 从零实现的分布式实时搜索系统，核心目标是在“可接受一致性延迟”下提供高并发检索能力，并具备可解释的架构取舍与工程化落地。
+
+---
+
+## 2. 架构总览
+
+### 2.1 组件与职责
+
+- `api_gateway`：系统统一入口，负责接入层协议（WebSocket/HTTP）、缓存、防击穿、搜索聚合。
+- `index_service`：索引构建与检索服务，通过 gRPC 暴露能力，按分片水平扩展。
+- `mysql`：业务主存，保存文章及 `outbox`（事务发件箱）。
+- `kafka`：异步总线，解耦“写入主存”和“构建索引”。
+- `redis`：热点查询缓存。
+- `etcd`：服务注册与发现（gateway 侧动态感知 indexer 节点）。
+
+### 2.2 请求链路（简图）
 
 ```mermaid
-graph TD
-    User[用户/浏览器] -->|WebSocket/HTTP| Gateway[API Gateway (BFF层)]
-    
-    subgraph "接入层 (High Availability)"
-        Gateway -->|1. 读写分离| Redis[Redis Cache]
-        Gateway -->|2. 事务双写| MySQL[(MySQL Source)]
-    end
-    
-    subgraph "异步消息层 (Decoupling)"
-        MySQL -->|3. Relay 轮询| Kafka[Kafka Cluster]
-    end
-    
-    subgraph "索引核心层 (Sharding)"
-        Kafka -->|4. 批量消费| IndexNode1[Index Service 节点1]
-        Kafka -->|4. 批量消费| IndexNode2[Index Service 节点2]
-        
-        IndexNode1 -->|gRPC| Gateway
-        IndexNode2 -->|gRPC| Gateway
-    end
+graph LR
+  U[Client] --> GW[API Gateway]
+  GW --> R[(Redis)]
+  GW -->|miss| IX[gRPC Index Service]
+  GW --> MY[(MySQL)]
+  MY --> OB[(Outbox)]
+  OB --> RL[Relay]
+  RL --> K[Kafka]
+  K --> IX
 ```
-
-### 2.2 关键组件
-
-| 组件 | 技术选型 | 核心职责 |
-| :--- | :--- | :--- |
-| **API Gateway** | Gin + Gorilla WebSocket | 流量入口，负责协议转换、鉴权、**SingleFlight 防击穿**、**Result Cache**。 |
-| **Index Service** | gRPC + Etcd | 索引构建与检索服务。无状态设计，支持 K8s 水平扩容。 |
-| **KV Storage** | BoltDB / BadgerDB | **正排索引存储**。作为 WAL (Write-Ahead Log) 保证数据持久化。 |
-| **In-Memory Index** | SkipList (跳表) | **倒排索引**。基于跳表实现高效的 `Posting List` 存储与交集运算。 |
-| **Message Queue** | Kafka | **削峰填谷**。解耦入库与索引构建，支持批量写入优化 IO。 |
 
 ---
 
-## 3. 核心难点与解决方案 (面试重点)
+## 3. 核心数据流
 
-### 难点一：分布式环境下的数据最终一致性
-**挑战**：用户发布文章写入 MySQL 后，如果直接调 RPC 通知索引服务，可能会因为网络抖动导致“文章已发布但搜不到”；反之，如果先发消息后写库，可能导致“幽灵消息”。
+## 3.1 写入流（发布文档）
 
-**解决方案：Transactional Outbox 模式 (事务发件箱)**
-1.  **原理**：利用 MySQL 本地事务的原子性。在写入 `articles` 表的同一个事务中，将消息写入 `outbox` 表。
-2.  **流程**：
-    *   `Begin Tx` -> `Insert Article` -> `Insert Outbox` -> `Commit Tx`.
-    *   **Relay Service**（后台协程）轮询 `outbox` 表，将状态为 `Pending` 的消息投递到 Kafka。
-    *   投递成功后更新状态为 `Sent`。
-    *   **收益**：确保了**业务落库**与**消息发送**的强一致性，实现了 At-Least-Once（至少一次）投递，彻底解决了数据丢失问题。
+1. Gateway 收到写请求。  
+2. 在 MySQL 单事务中同时写入：
+   - 业务表（如文章）
+   - `outbox` 表（待投递消息）  
+3. Relay 后台轮询 `outbox`，投递到 Kafka。  
+4. Index Service 消费 Kafka，写正排存储并更新内存倒排索引。  
 
-#### 代码实现细节 (Code Implementation)
+### 为什么是这个方案
 
-1.  **数据库设计 (MySQL Schema)**
-    *   `articles` 表：存储业务数据。
-    *   `outbox` 表：存储待发送的消息。关键字段包括 `topic` (Kafka主题), `payload` (二进制数据), `status` (0:Pending, 1:Sent)。
-    ```sql
-    CREATE TABLE `outbox` (
-      `id` bigint unsigned AUTO_INCREMENT,
-      `topic` varchar(255) NOT NULL,
-      `payload` longblob,
-      `status` tinyint DEFAULT 0, -- 0:待发送, 1:已发送
-      PRIMARY KEY (`id`)
-    );
-    ```
+- 解决“DB 成功但消息丢失”与“消息成功但 DB 失败”的双写不一致。
+- 投递语义是 `at-least-once`，通过下游幂等确保最终状态正确。
+- 业务上允许短暂“写后延迟可搜”，所以最终一致是合理 trade-off。
 
-2.  **双写流程 (API Gateway)**
-    *   代码位置：`api_gateway/main.go`
-    *   利用 GORM 的 `tx := db.Begin()` 开启事务。
-    *   先后执行 `tx.Create(&article)` 和 `tx.Create(&outboxMsg)`。
-    *   最后 `tx.Commit()`。
+## 3.2 查询流（搜索）
 
-3.  **异步中继 (Relay Service)**
-    *   代码位置：`api_gateway/infra/relay.go`
-    *   **轮询机制**：后台 Goroutine 每隔 50ms 轮询一次 DB。
-    *   **批量处理**：每次 `Limit(100)` 取出 `status=0` 的消息。
-    *   **发送与确认**：调用 Sarama SDK 发送 Kafka，成功后回调更新 MySQL `status=1`。
+1. Gateway 收到查询请求（生产场景主用 WebSocket；保留 HTTP 接口主要用于压测与调试）。  
+2. 先查 Redis，命中直接返回。  
+3. 未命中时进入 SingleFlight（同 key 归并），只触发一次下游 gRPC 搜索。  
+4. Gateway 向 indexer 分片并发请求并聚合结果，回写缓存。  
 
+## 3.3 场景化走查（建议面试时照这个讲）
 
-### 难点二：高并发下的搜索性能与稳定性
-**挑战**：热门关键词（如 "iPhone"）可能会引发瞬间高并发流量（热点击穿），且倒排链过长会导致计算耗时。
+### 场景 1：用户发布一篇文章
 
-**解决方案：多级缓存 + 防击穿机制**
-1.  **SingleFlight (归并回源)**：
-    *   在 API Gateway 层引入 `golang.org/x/sync/singleflight`。
-    *   **效果**：当 1000 个用户同时搜索 "Golang" 时，系统**只向后端发起 1 次 RPC 调用**，所有请求共享这一个结果。极大降低了下游负载。
-2.  **Cache Aside Pattern**：
-    *   优先查 Redis，未命中查 RPC 并回写。设置较短 TTL (如 1分钟) 保证热点数据的实时性。
+**业务预期**
+- 接口返回成功后，文章最终必须可搜，不能“永久丢失”。
 
-### 难点三：复杂布尔查询的高效执行
-**挑战**：如何高效支持 `(A AND B) OR (C AND D)` 这样复杂的嵌套逻辑？普通的数组求交集复杂度为 O(N)，在大数据量下性能极差。
+**技术挑战**
+- 数据要同时进入 MySQL 和索引，天然是双写。
 
-**解决方案：基于跳表 (SkipList) 的多路归并**
-1.  **数据结构**：倒排链（Posting List）使用**跳表**而非数组存储 DocID。
-2.  **算法优化**：
-    *   利用跳表的 `SkipTo(target)` 能力，在求交集（AND）时，可以直接**跳过**大量不匹配的 ID。
-    *   复杂度从线性的 O(N) 降低到 O(M * log N)，其中 M 为较短链的长度。
-3.  **位图过滤**：在跳表节点中嵌入 `Bitmap`，在遍历时直接进行属性过滤（如“只看有图的文章”），无需回查正排。
+**采用方案**
+- 同事务写业务数据 + outbox；异步投递 Kafka；indexer 消费后建索引。
 
-### 难点四：索引服务的快速恢复与持久化
-**挑战**：倒排索引全在内存中，服务重启会导致数据丢失；如果每次重启都全量拉取 MySQL，启动时间过长且数据库压力大。
+**为什么不用同步 RPC 双写**
+- 同步双写原子性弱、下游故障会拖慢主链路、补偿复杂。
 
-**解决方案：WAL (Write-Ahead Log) 思想**
-1.  **写入流程**：文档先序列化写入本地嵌入式数据库 (**BoltDB**)，作为“正排索引”和持久化日志。
-2.  **内存构建**：写入 BoltDB 成功后，更新内存中的 SkipList。
-3.  **重启恢复**：服务启动时，直接扫描本地 BoltDB 文件重建内存倒排索引。
-4.  **收益**：利用顺序读写的高效性，实现了秒级启动恢复，且无需依赖外部 MySQL。
+**代价**
+- 强实时性让位于最终一致，存在短暂可见性延迟。
+
+### 场景 2：热门关键词瞬时并发查询
+
+**业务预期**
+- 热点词并发冲击时，系统不能被击穿。
+
+**技术挑战**
+- 缓存 miss 时，同 key 高并发会放大下游请求。
+
+**采用方案**
+- Redis 缓存 + SingleFlight 回源归并 + 分片并发检索。
+
+**为什么这样组合**
+- 缓存负责“降频”，SingleFlight负责“归并”，分片并发负责“吞吐”。
+
+**代价**
+- 首个慢请求可能拖累同 key 等待者，必须配合超时与熔断策略。
 
 ---
 
-## 4. 目录结构说明
+## 4. 索引内核设计
+
+## 4.1 存算分离
+
+- **算（内存）**：SkipList 倒排索引，用于快速检索与布尔合并。
+- **存（本地 KV）**：BoltDB/Badger 作为正排与持久化基础，重启可恢复。
+
+## 4.2 选 SkipList 的原因
+
+- 动态插入复杂度好（相对数组追加后维护排序更可控）。
+- 适合实现 `SkipTo` 以优化交并集求解。
+- 对 Go 并发实现更友好，易于控制复杂度。
+
+## 4.3 一致性与幂等
+
+- 消费重复消息是常态（网络抖动、重试、重平衡）。
+- Index 更新逻辑按文档 ID 覆盖/去重，确保重复消费不造成结果污染。
+
+---
+
+## 5. 服务治理与弹性
+
+## 5.1 服务发现与负载
+
+- Index 节点注册到 etcd。
+- Gateway watch 节点变更，维护本地连接与分片路由。
+- gRPC 客户端连接管理采用“锁外构建 + 锁内提交”以降低热点锁竞争。
+
+## 5.2 优雅停机（已落地）
+
+- 入口服务支持优雅关停流程（停止接收新流量 -> 处理在途请求 -> 超时退出）。
+- WebSocket 连接集中由 `ws_hub` 管理，支持 shutdown 时主动 `CloseAll`。
+- 通过 readiness/liveness 配合 K8s，下线期间尽量避免新请求进入。
+
+---
+
+## 6. 可观测性与性能诊断
+
+## 6.1 指标体系
+
+- Prometheus 暴露接口级吞吐、延迟、状态码等指标。
+- pprof 结合火焰图用于 CPU/锁/阻塞热点定位。
+
+## 6.2 已识别热点（近期压测）
+
+- 高频日志输出会明显推高 `runtime.cgocall / syscall write` 占比，影响尾延迟。
+- 已做日志结构化、异步化与采样降噪，降低 IO 干扰。
+- 在单机 Docker Desktop + kind（3 worker 逻辑集群）场景，平台层（容器运行时/控制面）会先到上限，出现 `TLS handshake timeout`，并非纯业务逻辑瓶颈。
+
+---
+
+## 7. 压测结论（截至 2026-02-27）
+
+> 详细记录见 `deploy/k8s/loadtest/PERF_REPORT_2026-02-27.md`
+
+- 3 worker（同一宿主机）可稳定跑到 `~9k RPS`。  
+- 冲到 `12k+` 时出现平台不稳定（K8s API / Docker Desktop 超时），结果不可重复。  
+- 在平台状态较好时能冲到 `13k~14k RPS`，但 `p95/p99` 显著恶化，属于“吞吐可挤、质量不稳”区间。  
+
+### 解释
+
+- kind 多 worker 只是逻辑分布式，算力仍是单机池。
+- 当平台开销（网络栈、容器调度、控制面）占主导时，横向收益会被吃掉。
+
+---
+
+## 8. 关键权衡（面试高频）
+
+- 一致性：选择最终一致 + 幂等，而非全链路强一致事务。
+- 性能：优先保障高频路径（缓存、归并、连接管理），接受冷路径复杂度。
+- 可维护性：索引内核自主可控，但保留存储引擎可替换能力。
+- 可靠性：先保证“不会错”，再优化“更快”。
+
+### 8.1 为什么不直接依赖现成搜索中间件
+
+**不是不能用，而是当前项目目标不同：**
+- 目标是展示从索引内核到一致性链路的完整设计与实现能力。
+- 需要可解释每个关键取舍（结构、协议、治理、可观测）。
+- 代价是研发成本更高、工程细节更多，但可学习价值和面试价值更高。
+
+---
+
+## 9. 风险与改进路线
+
+## 9.1 当前风险
+
+- Relay 轮询模式在高写入下会产生 DB 压力。
+- 单机环境压测结论不代表真实多机集群上限。
+- 极限压力下平台层先失稳，影响性能结论置信度。
+
+## 9.2 下一步优先级
+
+1. **P0**：稳态压测基线（`3k/6k/9k/12k` 固定回归）。  
+2. **P1**：压测时联动采集 pprof + Prometheus + 节点资源。  
+3. **P2**：迁移到多物理机/云主机做真分布式基准。  
+4. **P3**：评估 CDC 替代轮询 outbox，降低主库压力。  
+
+---
+
+## 10. 代码目录导航（面试可快速指路）
+
+- `cmd/api_gateway/main.go`：gateway 启动入口与生命周期。  
+- `api_gateway/router/router.go`：路由、搜索入口、WebSocket handler。  
+- `api_gateway/router/ws_hub.go`：WebSocket 连接管理与 shutdown 关闭策略。  
+- `api_gateway/rpc/client.go`：indexer 路由、连接管理、负载逻辑。  
+- `cmd/index_service/main.go`：index 服务启动与依赖初始化。  
+- `index_service/index_service.go`：消费、建索引、服务注册核心逻辑。  
+- `util/logger.go`：结构化日志、异步写、采样策略。  
+- `deploy/k8s/loadtest/README.md`：压测 runbook。  
+
+---
+
+## 11. 快速复现（本地）
 
 ```bash
-├── api_gateway/      # [BFF层] 处理 HTTP/WebSocket 请求
-│   ├── infra/        # 基础设施 (Redis, MySQL, Kafka, Relay)
-│   └── rpc/          # gRPC 客户端封装 (含 LoadBalancer)
-├── index_service/    # [核心服务] 索引构建与检索
-│   ├── consumer.go   # Kafka 消费者 (批量处理)
-│   └── service_hub.go # Etcd 服务注册
-├── internal/
-│   ├── indexer/      # 索引器门面 (协调正排与倒排)
-│   ├── kvdb/         # 正排索引存储 (BoltDB 实现)
-│   └── reverse_index/# 倒排索引核心 (SkipList 实现)
-├── types/            # Protobuf 定义与生成的代码
-└── deploy/           # K8s 部署配置 (YAML)
-```
-
-## 5. 快速启动
-
-### 依赖环境
-*   Docker & Kubernetes (Optional)
-*   Etcd, Kafka, Redis, MySQL
-
-### 编译与运行
-```bash
-# 1. 启动依赖设施
+# 1) 启动依赖
 docker-compose up -d
 
-# 2. 启动索引服务 (支持多节点)
-go run index_service/main.go -port 50051
+# 2) 启动 index service
+go run ./cmd/index_service/main.go
 
-# 3. 启动网关
-go run api_gateway/main.go -port 8080
-
-# 4. 访问测试
-open http://localhost:8080
+# 3) 启动 gateway
+go run ./cmd/api_gateway/main.go -port 8080
 ```
 
 ---
 
-## 5. 核心技术原理深析 (Deep Dive & Interview FAQ)
+## 12. 面试中建议的开场 30 秒
 
-### 5.1 SingleFlight 原理与源码剖析
-**原理**：SingleFlight 的核心作用是**请求合并**。它通过一个全局的 `Map` 记录正在进行的请求。
-*   **结构**：`Group` 结构体包含 `mu sync.Mutex` 和 `m map[string]*call`。`call` 结构体包含 `wg sync.WaitGroup` 和 `val, err`。
-*   **流程**：
-    1.  **Lock**: 获取互斥锁。
-    2.  **Check Map**: 用 Key 去 Map 查，看是否已有相同请求在处理 (`call` 存在)。
-    3.  **If Exists (命中)**: 释放锁，调用 `c.wg.Wait()` 阻塞等待，最后直接返回结果。
-    4.  **If Not Exists (未命中)**: 创建新 `call`，存入 Map，`wg.Add(1)`，释放锁。执行真正的函数 `fn()`。
-    5.  **Finish**: `fn()` 返回后，加锁，从 Map 删掉 Key，`wg.Done()` 唤醒所有等待者。
+“这个项目我主要解决了三个问题：第一是通过 Transactional Outbox + Kafka 实现写入到索引的最终一致性；第二是通过 Redis + SingleFlight + 分片并发检索保证高并发查询；第三是做了完整可观测和压测闭环，能够把瓶颈区分为业务热点和平台上限，并且有明确优化路线。”  
 
-**FAQ (面试官追问)**:
-*   **Q: 如果那个唯一的请求超时了或 Panic 了怎么办？**
-    *   A: `singleflight` 处理了 Panic，会 recover 并抛出。如果超时，所有等待的请求都会收到超时错误（通常需要在 `fn` 内部处理 context 超时）。
-*   **Q: 为什么不用互斥锁直接锁住整个函数？**
-    *   A: 互斥锁是**串行化**（一个接一个），SingleFlight 是**并行合并**（一批只执行一次），吞吐量天差地别。
+---
 
-### 5.1.1 gRPC 客户端连接池与“锁外 Dial”优化
+## 13. 典型工程问题与解法（面试可引用）
 
-**背景**：API Gateway 通过 Etcd watch 动态感知 `index_service` 节点变更，并在本地维护 `ShardID -> 节点列表` 的路由表（实现见 `api_gateway/rpc/client.go`）。如果在 `reloadNodes()` 的写锁内执行 `grpc.Dial()`：
-* Dial 可能受 DNS/网络影响变慢，导致写锁长时间持有，进而阻塞所有并发读请求（Search/AddDoc 等），表现为 P99/P999 延迟尖刺。
-* 并发读写连接表（map）如果没有统一加锁，可能触发 data race，严重时会出现 `concurrent map read and map write` 直接崩溃。
+### 13.1 节点动态变更引发尾延迟抖动
 
-**做法**（两阶段提交思路）：
-1. **锁外准备**：从 Etcd 取到最新节点列表，计算 `wantedAddrs`（目标地址集合）；在 `RLock` 下快照当前 `conns`；对缺失地址在锁外 Dial（得到 `dialedConns`）。
-2. **锁内提交**：在 `Lock` 下合并 `dialedConns` 到 `conns`（若已存在则关闭重复连接），构建新的 `shards/clients/totalShards`，并关闭不再需要的旧连接（地址不在 `wantedAddrs`）。
+- **问题现象**：服务节点上下线时，搜索接口 p99 突刺。  
+- **根因**：连接重载期间慢操作（拨号）阻塞共享锁。  
+- **解决方案**：连接更新改为“锁外准备 + 锁内提交”。  
+- **效果**：节点变更期间延迟更平滑。
 
-**收益**：
-* 把慢操作（Dial）从写锁中移出去，显著降低热点路径的锁竞争与尾延迟。
-* 连接可复用、节点下线时可关闭，避免 gRPC 连接泄漏导致的长期资源增长。
+### 13.2 高并发下日志写路径成为热点
 
-### 5.2 倒排索引：为什么选择跳表 (SkipList)?
-**原理**：跳表是一种**概率性平衡**的数据结构，通过维护多层链表来加速查找。底层是完整链表，上层是稀疏索引。
-*   **Search**: 从最高层开始，`Key > Next` 则右移，`Key < Next` 则下潜。复杂度 O(log N)。
-*   **Intersection (求交集)**:
-    *   假设有倒排链 A: `[1, 5, 9, ...]` 和 B: `[2, 5, 8, ...]`.
-    *   指针 `pA=1`, `pB=2`. `pA < pB`，利用跳表特性，A 可以直接 **SkipTo(2)**（甚至更大），而不需要一步步 `Next()`。这是数组无法比拟的优势。
+- **问题现象**：压测吞吐上不去，CPU 主要消耗在系统调用写日志。  
+- **根因**：同步日志 + 高频成功请求打印。  
+- **解决方案**：结构化日志、异步落盘、成功请求采样。  
+- **效果**：日志干扰下降，性能测试结果更稳定。
 
-**FAQ (面试官追问)**:
-*   **Q: 为什么不用红黑树 (Red-Black Tree)?**
-    *   A: 1. **范围查询**: 倒排索引常需要区间扫描，红黑树需要回溯，跳表直接遍历底层链表即可。2. **实现难度**: 红黑树旋转极其复杂，跳表代码简单。3. **并发友好**: 跳表只需局部 CAS 锁即可实现无锁并发，红黑树调整树高涉及全局锁。
-*   **Q: 为什么不用 B+ 树？**
-    *   A: B+ 树更适合磁盘存储（减少 IO 次数），纯内存场景下，跳表的指针跳转比 B+ 树的节点分裂/合并开销更小。
+### 13.3 滚动发布期间 WebSocket 连接残留
 
-### 5.3 分布式事务：Transactional Outbox 深度思考
-**原理**：将“发送消息”转化为“数据库写操作”。
-*   **原子性**: MySQL 保证 `Insert Business` 和 `Insert Message` 要么全成功，要么全失败。
-*   **At-Least-Once**: Relay 可能会 crash。如果 Relay 发送了 Kafka 但没来得及 Update DB，重启后会重发。
-    *   **应对**: 消费者端 (Index Service) 必须实现**幂等性 (Idempotency)**。我的设计中，倒排索引的 `Add` 操作是幂等的（多次 Add 相同 DocID 只会覆盖或忽略）。
+- **问题现象**：重启后客户端存在僵尸连接，偶发错误。  
+- **根因**：缺少统一连接回收机制。  
+- **解决方案**：引入 `ws_hub` 管理连接生命周期，并在 shutdown 主动 `CloseAll`。  
+- **效果**：发布期连接行为可控，恢复更快。
 
-**FAQ (面试官追问)**:
-*   **Q: 为什么不先发 Kafka 再 Commit DB?**
-    *   A: 发 Kafka 无法回滚。如果发成功了但 DB Commit 失败（死锁/断电），Kafka 消费者会读到一条“脏数据”（业务里实际上没有这篇文档）。
-*   **Q: 为什么不先 Commit DB 再发 Kafka?**
-    *   A: Commit 返回后进程立马挂了，Kafka 消息就丢了。导致数据不一致。
-*   **Q: Relay 轮询数据库会不会有性能瓶颈？**
-    *   A: 会。生产环境可以用 **CDC (Change Data Capture)** 如 Debezium 监听 Binlog 来代替轮询，降低 DB 压力。
+### 13.4 压测高档位结果不可复现
 
-### 5.4 存储引擎：BoltDB vs LSM Tree
-**原理**：
-*   **BoltDB (B+ Tree)**: 读多写少场景。使用 `mmap` 将文件映射到内存，利用 OS 的 Page Cache 管理缓存。支持 **COW (Copy-On-Write)**，读事务无锁，写事务串行。
-*   **BadgerDB (LSM Tree)**: 写多读少场景。写入只追加 MemTable (内存) 和 WAL (磁盘)，定期 Flush 到 SSTable。
-
-**FAQ (面试官追问)**:
-*   **Q: 为什么正排索引选 BoltDB？**
-    *   A: 文档详情查询通常是随机读，B+ 树读性能稳定。而且文档一旦写入修改较少，符合读多写少特性。
-*   **Q: 如果换成写操作极高的场景（如日志索引），你会怎么改？**
-    *   A: 我会把底层 KV 换成 **BadgerDB** 或 **RocksDB**。LSM Tree 将随机写转化为顺序写，吞吐量高 1-2 个数量级。我的代码通过 `KVStore` 接口隔离了实现，切换引擎只需改一行代码。
-```
+- **问题现象**：同参数多次压测波动过大，优化结论不可信。  
+- **根因**：测试口径与平台状态不一致（缓存状态、并发档位、宿主机负载）。  
+- **解决方案**：固定压测模板与分档，区分 warm/cold，统一结果落盘格式。  
+- **效果**：性能回归具备可比性和可解释性。

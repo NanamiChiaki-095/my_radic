@@ -11,9 +11,12 @@ import (
 	"my_radic/types"
 	"my_radic/util"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -23,7 +26,17 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+var ready atomic.Bool
+var accessLogSeq atomic.Uint64
+
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
+var (
+	accessLogSampleEvery  = envPositiveInt("RADIC_ACCESS_LOG_SAMPLE_EVERY", 100)
+	accessLogSlowMs       = envPositiveInt("RADIC_ACCESS_LOG_SLOW_MS", 500)
+	accessLogQueryMaxLen  = envPositiveInt("RADIC_ACCESS_LOG_QUERY_MAX_LEN", 128)
+	accessLogIncludeQuery = envBool("RADIC_ACCESS_LOG_INCLUDE_QUERY", false)
+)
 
 var (
 	requestCounter = prometheus.NewCounterVec(
@@ -41,14 +54,41 @@ var (
 		},
 		[]string{"method", "path"},
 	)
+	searchCacheHitTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "search_cache_hit_total",
+			Help: "Total number of search cache hits.",
+		},
+	)
+	searchCacheMissTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "search_cache_miss_total",
+			Help: "Total number of search cache misses.",
+		},
+	)
+	searchCacheErrorTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "search_cache_error_total",
+			Help: "Total number of search cache errors.",
+		},
+	)
 )
 
 func init() {
-	// 防止重复注册 Panic
-	// 在实际项目中，Metrics 注册通常放在独立的 metrics 包 init 中
-	// 这里简单处理，先不重复注册，或者假设只引用一次
-	prometheus.Register(requestCounter)
-	prometheus.Register(requestDuration)
+	for _, collector := range []prometheus.Collector{
+		requestCounter,
+		requestDuration,
+		searchCacheHitTotal,
+		searchCacheMissTotal,
+		searchCacheErrorTotal,
+	} {
+		if err := prometheus.Register(collector); err != nil {
+			if _, ok := err.(prometheus.AlreadyRegisteredError); ok {
+				continue
+			}
+			util.LogError("prometheus.Register failed: %v", err)
+		}
+	}
 }
 
 func PrometheusMiddleware() gin.HandlerFunc {
@@ -69,19 +109,124 @@ func PrometheusMiddleware() gin.HandlerFunc {
 }
 
 // NewRouter 构造并返回 API Gateway 的 Gin 引擎
+func envPositiveInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func envBool(key string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func shouldSampleAccessLog(status int, latency time.Duration) bool {
+	if status >= http.StatusBadRequest {
+		return true
+	}
+	if latency >= time.Duration(accessLogSlowMs)*time.Millisecond {
+		return true
+	}
+	if accessLogSampleEvery <= 1 {
+		return true
+	}
+	return accessLogSeq.Add(1)%uint64(accessLogSampleEvery) == 0
+}
+
+func AccessLogMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		rawPath := c.Request.URL.Path
+		if rawPath == "/healthz" || rawPath == "/readyz" || rawPath == "/metrics" {
+			c.Next()
+			return
+		}
+
+		start := time.Now()
+		c.Next()
+		latency := time.Since(start)
+		status := c.Writer.Status()
+		if !shouldSampleAccessLog(status, latency) {
+			return
+		}
+
+		path := c.FullPath()
+		if path == "" {
+			path = rawPath
+		}
+
+		fields := util.LogFields{
+			"method":     c.Request.Method,
+			"path":       path,
+			"status":     status,
+			"latency_ms": float64(latency.Microseconds()) / 1000.0,
+			"client_ip":  c.ClientIP(),
+		}
+		if accessLogIncludeQuery {
+			if query := c.Request.URL.RawQuery; query != "" {
+				if len(query) > accessLogQueryMaxLen {
+					query = query[:accessLogQueryMaxLen] + "..."
+				}
+				fields["query"] = query
+			}
+		}
+
+		switch {
+		case status >= http.StatusInternalServerError:
+			util.LogErrorWithFields("http_access", fields)
+		case status >= http.StatusBadRequest || latency >= time.Duration(accessLogSlowMs)*time.Millisecond:
+			util.LogWarnWithFields("http_access", fields)
+		default:
+			util.LogInfoWithFields("http_access", fields)
+		}
+	}
+}
+
 func NewRouter() *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
-	r := gin.Default()
+	r := gin.New()
 
-	r.Use(PrometheusMiddleware())
+	r.Use(gin.Recovery(), PrometheusMiddleware(), AccessLogMiddleware())
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	r.GET("/article/:id", getArticleDetail)
 	r.POST("/add_doc", addDocHandler)
 	r.GET("/search", searchWebSocketHandler)
 	r.GET("/search_http", searchHTTPHandler)
-
+	r.GET("/healthz", func(c *gin.Context) {
+		c.Status(200)
+	})
+	r.GET("/readyz", func(c *gin.Context) {
+		if IsReady() {
+			c.Status(200)
+			return
+		}
+		c.Status(503)
+	})
 	return r
+}
+
+func SetReady(v bool) {
+	ready.Store(v)
+}
+
+func IsReady() bool {
+	return ready.Load()
 }
 
 type AddDocRequest struct {
@@ -170,10 +315,17 @@ var upgrader = websocket.Upgrader{
 }
 
 func searchWebSocketHandler(c *gin.Context) {
+	if !IsReady() {
+		c.Status(http.StatusServiceUnavailable)
+		return
+	}
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		return
 	}
+	wc := NewWsConn(conn)
+	DefaultWSHub().Add(wc)
+	defer DefaultWSHub().Remove(wc)
 	defer conn.Close()
 
 	for {
@@ -191,16 +343,22 @@ func searchWebSocketHandler(c *gin.Context) {
 		var cachedRes index_service.SearchResponse
 		hit, err := infra.GetSearchCache(context.Background(), cacheKey, &cachedRes)
 		if err != nil {
+			searchCacheErrorTotal.Inc()
 			util.LogError("GetSearchCache error: %v", err)
 		}
 
 		if hit {
+			searchCacheHitTotal.Inc()
 			jsonBytes, _ := json.Marshal(&cachedRes)
-			if err := conn.WriteMessage(messageType, jsonBytes); err != nil {
+			wc.writeMu.Lock()
+			err := wc.Conn.WriteMessage(messageType, jsonBytes)
+			wc.writeMu.Unlock()
+			if err != nil {
 				break
 			}
 			continue
 		}
+		searchCacheMissTotal.Inc()
 
 		rpcReq := &index_service.SearchRequest{
 			Query: &types.TermQuery{
@@ -213,12 +371,17 @@ func searchWebSocketHandler(c *gin.Context) {
 
 		res, err := rpc.Client.Search(context.Background(), rpcReq)
 		if err != nil {
-			conn.WriteMessage(messageType, []byte("Error: "+err.Error()))
+			wc.writeMu.Lock()
+			_ = wc.Conn.WriteMessage(messageType, []byte("Error: "+err.Error()))
+			wc.writeMu.Unlock()
 			continue
 		}
 
 		jsonBytes, _ := json.Marshal(res)
-		if err := conn.WriteMessage(messageType, jsonBytes); err != nil {
+		wc.writeMu.Lock()
+		err = wc.Conn.WriteMessage(messageType, jsonBytes)
+		wc.writeMu.Unlock()
+		if err != nil {
 			break
 		}
 
@@ -242,13 +405,16 @@ func searchHTTPHandler(c *gin.Context) {
 	var cachedRes index_service.SearchResponse
 	hit, err := infra.GetSearchCache(c, cacheKey, &cachedRes)
 	if err != nil {
+		searchCacheErrorTotal.Inc()
 		util.LogError("GetSearchCache error: %v", err)
 	}
 
 	if hit {
+		searchCacheHitTotal.Inc()
 		c.JSON(http.StatusOK, &cachedRes)
 		return
 	}
+	searchCacheMissTotal.Inc()
 
 	rpcReq := &index_service.SearchRequest{
 		Query: &types.TermQuery{

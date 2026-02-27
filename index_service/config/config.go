@@ -3,6 +3,8 @@ package config
 import (
 	"my_radic/util"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/goccy/go-yaml"
 )
@@ -46,5 +48,29 @@ func InitConfig(path string) error {
 	}
 
 	util.LogInfo("Config loaded from %s", path)
+	applyEnvOverrides(Conf)
 	return nil
+}
+
+func applyEnvOverrides(conf *Config) {
+	if conf == nil {
+		return
+	}
+
+	overrideInt := func(envKey string, target *int) {
+		raw := strings.TrimSpace(os.Getenv(envKey))
+		if raw == "" {
+			return
+		}
+		value, err := strconv.Atoi(raw)
+		if err != nil {
+			util.LogWarn("Ignore invalid %s=%q: %v", envKey, raw, err)
+			return
+		}
+		*target = value
+		util.LogInfo("Config override from env: %s=%d", envKey, value)
+	}
+
+	overrideInt("RADIC_SHARD_ID", &conf.ShardID)
+	overrideInt("RADIC_TOTAL_SHARDS", &conf.TotalShards)
 }

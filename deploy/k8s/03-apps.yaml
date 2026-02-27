@@ -28,12 +28,36 @@ spec:
       labels:
         app: indexer
     spec:
+      terminationGracePeriodSeconds: 30
       containers:
       - name: indexer
-        image: my_radic/indexer:v1
+        image: my_radic/indexer:v2
         imagePullPolicy: Never
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          shard_id="${HOSTNAME##*-}"
+          export RADIC_SHARD_ID="${shard_id}"
+          exec ./index_server -config /app/config/config.yaml
+        env:
+        - name: RADIC_TOTAL_SHARDS
+          value: "3"
         ports:
         - containerPort: 9000
+        readinessProbe:
+          tcpSocket:
+            port: 9000
+          initialDelaySeconds: 2
+          periodSeconds: 3
+          timeoutSeconds: 1
+          failureThreshold: 3
+        livenessProbe:
+          tcpSocket:
+            port: 9000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 1
+          failureThreshold: 3
         volumeMounts:
         - name: config
           mountPath: /app/config
@@ -82,12 +106,29 @@ spec:
       labels:
         app: gateway
     spec:
+      terminationGracePeriodSeconds: 20
       containers:
       - name: gateway
-        image: my_radic/gateway:v1
+        image: my_radic/gateway:v2
         imagePullPolicy: Never
         ports:
         - containerPort: 8080
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 2
+          periodSeconds: 3
+          timeoutSeconds: 1
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 1
+          failureThreshold: 3
         volumeMounts:
         - name: config
           mountPath: /app/config
@@ -113,9 +154,10 @@ spec:
       labels:
         app: relay
     spec:
+      terminationGracePeriodSeconds: 20
       containers:
       - name: relay
-        image: my_radic/relay:v1
+        image: my_radic/relay:v2
         imagePullPolicy: Never
         volumeMounts:
         - name: config

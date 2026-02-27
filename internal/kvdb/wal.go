@@ -298,6 +298,15 @@ func (w *MmapWAL) Path() string {
 	return w.path
 }
 
+func (w *MmapWAL) CurrentSeq() uint64 {
+	if w == nil {
+		return 0
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.seqNum
+}
+
 // Close 关闭 WAL，刷盘并解除映射
 func (w *MmapWAL) Close() error {
 	if !atomic.CompareAndSwapInt32(&w.closed, 0, 1) {

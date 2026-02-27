@@ -7,8 +7,12 @@ import (
 	"my_radic/index_service/config"
 	"my_radic/util"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"syscall"
 
 	"google.golang.org/grpc"
@@ -18,9 +22,17 @@ import (
 
 func main() {
 	configPath := flag.String("config", "./index_service/config/config.yaml", "Path to config file")
+	pprofAddr := flag.String("pprof", "", "pprof listen address, e.g. :6061 (empty to disable)")
+	pprofMutexFraction := flag.Int("pprof-mutex-fraction", 5, "mutex profile fraction for pprof (0 to disable)")
+	pprofBlockRate := flag.Int("pprof-block-rate", 1, "block profile rate for pprof (0 to disable)")
 	flag.Parse()
 
-	util.InitLogger("")
+	util.SetServiceName("index_service")
+	if err := util.InitLogger(filepath.Join("logs", "index_service.jsonl")); err != nil {
+		panic(err)
+	}
+	defer util.CloseLogger()
+	startPprofServer("index_service", *pprofAddr, *pprofMutexFraction, *pprofBlockRate)
 
 	// 1. 初始化配置
 	if err := config.InitConfig(*configPath); err != nil {
@@ -79,8 +91,8 @@ func main() {
 			util.LogError("Failed to close worker: %v", err)
 		}
 
-		util.CloseLogger()
 		util.LogInfo("Shutdown complete")
+		util.CloseLogger()
 		os.Exit(0)
 	}()
 
@@ -88,4 +100,22 @@ func main() {
 	if err := server.Serve(lis); err != nil {
 		panic(err)
 	}
+}
+
+func startPprofServer(service, addr string, mutexFraction, blockRate int) {
+	if addr == "" {
+		return
+	}
+	if mutexFraction >= 0 {
+		runtime.SetMutexProfileFraction(mutexFraction)
+	}
+	if blockRate >= 0 {
+		runtime.SetBlockProfileRate(blockRate)
+	}
+	go func() {
+		util.LogInfo("%s pprof listening on %s", service, addr)
+		if err := http.ListenAndServe(addr, nil); err != nil {
+			util.LogError("%s pprof server stopped: %v", service, err)
+		}
+	}()
 }

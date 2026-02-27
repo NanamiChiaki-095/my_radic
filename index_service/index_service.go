@@ -8,6 +8,7 @@ import (
 	reverseindex "my_radic/internal/reverse_index"
 	"my_radic/types"
 	"my_radic/util"
+	"os"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -48,6 +49,11 @@ type IndexServiceWorker struct {
 	replicaMu      sync.Mutex
 	replicaClients map[string]IndexServiceClient
 	replicaConns   map[string]*grpc.ClientConn
+
+	checkpointPath string
+	wal            *kvdb.MmapWAL
+	checkpointStop chan struct{}
+	checkpointDone chan struct{}
 }
 
 // Init 初始化索引服务 Worker。
@@ -83,6 +89,14 @@ func (s *IndexServiceWorker) Init(docNumEstimate int, dbPath string, kafkaAddrs 
 
 	// 加载检查点
 	checkpointPath := filepath.Join(dbPath, "checkpoint")
+	checkpointExists := true
+	if _, statErr := os.Stat(checkpointPath); statErr != nil {
+		if !os.IsNotExist(statErr) {
+			util.LogError("IndexerServiceWorker Init checkpoint stat err: %v", statErr)
+			return statErr
+		}
+		checkpointExists = false
+	}
 	offset, err := util.LoadCheckpoint(checkpointPath)
 	if err != nil {
 		util.LogError("IndexerServiceWorker Init LoadCheckpoint err: %v", err)
@@ -110,7 +124,9 @@ func (s *IndexServiceWorker) Init(docNumEstimate int, dbPath string, kafkaAddrs 
 		util.LogError("IndexerServiceWorker Init wal err: %v", err)
 		return err
 	}
-	revIdx := reverseindex.NewSkipListReverseIndexWithWALMode(docNumEstimate, wal, 1024, false)
+	// 启动恢复阶段先禁用 WAL，避免 LoadFromForwardIndex / ReplayWALFrom 反向写入 WAL，
+	// 导致每次重启都产生大量重复日志和重复回放。
+	revIdx := reverseindex.NewSkipListReverseIndex(docNumEstimate)
 
 	// 3. 组装 Indexer
 	s.Indexer = indexer.NewIndexer(forwardIndex, revIdx)
@@ -122,18 +138,41 @@ func (s *IndexServiceWorker) Init(docNumEstimate int, dbPath string, kafkaAddrs 
 		return err
 	}
 	util.LogInfo("IndexerServiceWorker Init LoadFromForwardIndex success, count: %d", count)
-	lastOffset, err := s.Indexer.ReplayWALFrom(wal, offset)
-	if err != nil {
-		util.LogError("IndexerServiceWorker Init ReplayWALFrom err: %v", err)
-		_ = s.Indexer.Close()
-		return err
+	shouldReplay := checkpointExists && !(offset == 0 && count > 0)
+	if shouldReplay {
+		lastOffset, replayErr := s.Indexer.ReplayWALFrom(wal, offset)
+		if replayErr != nil {
+			util.LogError("IndexerServiceWorker Init ReplayWALFrom err: %v", replayErr)
+			_ = s.Indexer.Close()
+			return replayErr
+		}
+		if saveErr := util.SaveCheckpoint(checkpointPath, lastOffset); saveErr != nil {
+			util.LogError("IndexerServiceWorker Init SaveCheckpoint err: %v", saveErr)
+			_ = s.Indexer.Close()
+			return saveErr
+		}
+		util.LogInfo("IndexerServiceWorker Init ReplayWALFrom success, lastOffset: %d", lastOffset)
+	} else {
+		if checkpointExists && offset == 0 && count > 0 {
+			util.LogWarn("IndexerServiceWorker Init checkpoint offset is 0 with non-empty forward index, skip WAL replay")
+		} else {
+			util.LogWarn("IndexerServiceWorker Init checkpoint missing, skip WAL replay on this boot")
+		}
+		lastOffset := wal.CurrentSeq()
+		if saveErr := util.SaveCheckpoint(checkpointPath, lastOffset); saveErr != nil {
+			util.LogError("IndexerServiceWorker Init SaveCheckpoint err: %v", saveErr)
+			_ = s.Indexer.Close()
+			return saveErr
+		}
+		util.LogInfo("IndexerServiceWorker Init checkpoint refreshed, lastOffset: %d", lastOffset)
 	}
-	if err := util.SaveCheckpoint(checkpointPath, lastOffset); err != nil {
-		util.LogError("IndexerServiceWorker Init SaveCheckpoint err: %v", err)
-		_ = s.Indexer.Close()
-		return err
-	}
-	util.LogInfo("IndexerServiceWorker Init ReplayWALFrom success, lastOffset: %d", lastOffset)
+
+	s.checkpointPath = checkpointPath
+	s.wal = wal
+	s.startCheckpointLoop(5 * time.Second)
+
+	// 恢复完成后再启用 WAL，后续在线写入才会落盘。
+	revIdx.EnableWALWithMode(wal, 1024, false)
 
 	// 初始化分片信息
 	s.ShardID = int32(shardID)
@@ -160,15 +199,71 @@ func (s *IndexServiceWorker) Init(docNumEstimate int, dbPath string, kafkaAddrs 
 
 // Close 关闭服务，释放资源（如关闭数据库连接）。
 func (s *IndexServiceWorker) Close() error {
+	s.stopCheckpointLoop()
+	s.persistCheckpoint()
+
+	if s.KafkaConsumer != nil {
+		_ = s.KafkaConsumer.Close()
+	}
+
 	s.replicaMu.Lock()
 	for _, conn := range s.replicaConns {
 		_ = conn.Close()
 	}
 	s.replicaMu.Unlock()
+
+	var closeErr error
 	if s.Indexer != nil {
-		return s.Indexer.Close()
+		closeErr = s.Indexer.Close()
 	}
-	return nil
+	s.wal = nil
+	return closeErr
+}
+
+func (s *IndexServiceWorker) persistCheckpoint() {
+	if s.wal == nil || s.checkpointPath == "" {
+		return
+	}
+	if err := util.SaveCheckpoint(s.checkpointPath, s.wal.CurrentSeq()); err != nil {
+		util.LogWarn("IndexerServiceWorker persistCheckpoint err: %v", err)
+	}
+}
+
+func (s *IndexServiceWorker) startCheckpointLoop(interval time.Duration) {
+	if s.wal == nil || s.checkpointPath == "" {
+		return
+	}
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	s.stopCheckpointLoop()
+	s.checkpointStop = make(chan struct{})
+	s.checkpointDone = make(chan struct{})
+	go func(stop <-chan struct{}, done chan<- struct{}) {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.persistCheckpoint()
+			case <-stop:
+				return
+			}
+		}
+	}(s.checkpointStop, s.checkpointDone)
+}
+
+func (s *IndexServiceWorker) stopCheckpointLoop() {
+	if s.checkpointStop == nil {
+		return
+	}
+	close(s.checkpointStop)
+	if s.checkpointDone != nil {
+		<-s.checkpointDone
+	}
+	s.checkpointStop = nil
+	s.checkpointDone = nil
 }
 
 // AddDoc 处理添加单条文档的请求。

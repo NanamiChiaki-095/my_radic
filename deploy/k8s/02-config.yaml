@@ -45,3 +45,5 @@ data:
     data_dir: "/data"
     db_type: "badger"
     rpc_port: 9000
+    shard_id: 0
+    total_shards: 3

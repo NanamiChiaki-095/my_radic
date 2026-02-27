@@ -1,0 +1,33 @@
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: radic-search-dist
+  namespace: radic
+spec:
+  parallelism: 4
+  cleanup: post
+  script:
+    configMap:
+      name: radic-search-dist-script
+      file: k6-search.js
+  runner:
+    image: grafana/k6:0.49.0
+    env:
+    - name: TARGET_BASE
+      value: "http://gateway.radic.svc.cluster.local:8080"
+    - name: SEARCH_ENDPOINT
+      value: "/search_http"
+    - name: SEARCH_QUERY
+      value: "golang"
+    - name: DURATION
+      value: "2m"
+    - name: RATE
+      value: "2000"
+    - name: PRE_ALLOCATED_VUS
+      value: "400"
+    - name: MAX_VUS
+      value: "2000"
+    - name: REQUEST_TIMEOUT
+      value: "15s"
+    - name: PARSE_JSON
+      value: "0"
