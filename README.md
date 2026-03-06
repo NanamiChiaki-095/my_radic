@@ -14,7 +14,7 @@
 *   **手写倒排索引**：采用 **跳表 (SkipList)** 实现 Posting List。相比数组，跳表支持 **O(log N)** 的快速查找与 `SkipTo` 操作，极大地加速了多路归并（AND/OR）查询。
 *   **存算分离存储**：
     *   **计算层 (In-Memory)**：内存跳表承载实时检索与 **TF-IDF** 打分计算。
-    *   **存储层 (Disk-Based)**：集成 **BoltDB (B+ Tree)** 作为本地 WAL 与正排索引存储，支持**秒级崩溃恢复**，无需依赖重型外部数据库重建索引。
+    *   **存储层 (Disk-Based)**：以 **BoltDB / Badger** 作为正排索引存储，并结合 **mmap WAL** 做倒排增量恢复，支持**秒级崩溃恢复**。
 
 ### 2. 金融级数据一致性方案
 *   **Transactional Outbox 模式**：通过本地事务原子性，将“业务数据写库”与“同步指令发件”绑定，彻底解决了微服务架构下的**双写一致性**难题。
@@ -23,7 +23,7 @@
 
 ### 3. 高并发架构优化
 *   **防击穿机制**：API Gateway 集成 **SingleFlight** 归并回源，将海量并发的热点搜索合并为单次 RPC 调用，保护后端索引节点。
-*   **多级缓存策略**：实现 **Redis (Cache Aside) + 内存二级缓存**，热点请求响应延迟控制在微秒级。
+*   **缓存与回源归并**：实现 **Redis (Cache Aside) + SingleFlight**，在热点场景下降低后端索引节点压力。
 *   **Scatter-Gather 检索**：搜索请求通过 gRPC 并发广播至各分片节点，实现分布式并行计算。
 
 ### 4. 工业级工程实践
@@ -64,22 +64,33 @@
 
 *   [系统架构详述](./ARCHITECTURE.md) —— 深度解析设计理念与数据流。
 *   [分布式同步指南](./INTERVIEW_SYNC_GUIDE.md) —— 应对面试中关于数据一致性的深挖。
-*   [API 接口文档](./api_gateway/README.md) —— 快速上手指南。
+*   [面试问答手册](./INTERVIEW_QA_BATTLE.md) —— 汇总项目亮点、取舍与高频追问。
+*   [压测 Runbook](./deploy/k8s/loadtest/README.md) —— k6 + Kubernetes 压测流程与排障说明。
 
 ---
 
 ## 🚦 快速开始
 
 ```bash
-# 1. 启动基础设施 (MySQL, Redis, Kafka, Etcd)
-docker-compose up -d
+# 1. 准备基础设施
+# MySQL / Redis / Etcd 请先在本机启动，Kafka 可使用仓库脚本拉起
+powershell -ExecutionPolicy Bypass -File .\scripts\kafka-local.ps1 -Mode start
 
 # 2. 启动 Index Service
-go run main.go
+go run ./cmd/index_service -config ./index_service/config/config.yaml
 
 # 3. 启动 API Gateway
-go run api_gateway/main.go -port 8080
+go run ./cmd/api_gateway -port 8080 -config ./api_gateway/config/gateway_config.yaml
 
-# 4. 执行压力测试
-go run util/loader/main.go
+# 4. 启动 Relay（负责把 Outbox 投递到 Kafka）
+go run ./cmd/relay -config ./api_gateway/config/gateway_config.yaml
+
+# 5. 写入样例数据并做一次搜索烟雾测试
+go run ./cmd/tools/seed_data
+go run ./cmd/tools/client_demo -k Kafka
+
+# 6. HTTP 搜索接口（统一返回 {code,msg,data}）
+curl "http://localhost:8080/search_http?q=kafka"
 ```
+
+如需按 Kubernetes 方式启动整套集群，请参考 `deploy/k8s/01-infrastructure.yaml`、`deploy/k8s/02-config.yaml` 和 `deploy/k8s/03-apps.yaml`。

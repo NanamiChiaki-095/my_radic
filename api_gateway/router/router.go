@@ -237,7 +237,11 @@ type AddDocRequest struct {
 
 func getArticleDetail(c *gin.Context) {
 	idStr := c.Param("id")
-	id, _ := strconv.ParseUint(idStr, 10, 64)
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil || id == 0 {
+		response.Fail(c, http.StatusBadRequest, "Invalid article id")
+		return
+	}
 
 	var article model.Article
 	if err := infra.DB.First(&article, id).Error; err != nil {
@@ -394,12 +398,12 @@ func searchWebSocketHandler(c *gin.Context) {
 }
 
 func searchHTTPHandler(c *gin.Context) {
-	query := c.Query("q")
+	query := strings.TrimSpace(c.Query("q"))
 	if query == "" {
-		c.Status(http.StatusBadRequest)
+		response.Fail(c, http.StatusBadRequest, "Missing query parameter q")
 		return
 	}
-	query = strings.ToLower(strings.TrimSpace(query))
+	query = strings.ToLower(query)
 
 	cacheKey := "search:" + query
 	var cachedRes index_service.SearchResponse
@@ -411,7 +415,7 @@ func searchHTTPHandler(c *gin.Context) {
 
 	if hit {
 		searchCacheHitTotal.Inc()
-		c.JSON(http.StatusOK, &cachedRes)
+		response.OK(c, &cachedRes)
 		return
 	}
 	searchCacheMissTotal.Inc()
@@ -427,7 +431,8 @@ func searchHTTPHandler(c *gin.Context) {
 
 	res, err := rpc.Client.Search(c, rpcReq)
 	if err != nil {
-		c.String(http.StatusInternalServerError, "Error: "+err.Error())
+		util.LogError("search_http rpc error: %v", err)
+		response.Fail(c, http.StatusInternalServerError, "Search failed")
 		return
 	}
 
@@ -437,5 +442,5 @@ func searchHTTPHandler(c *gin.Context) {
 		}
 	}()
 
-	c.JSON(http.StatusOK, res)
+	response.OK(c, res)
 }
